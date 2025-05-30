@@ -1,0 +1,191 @@
+import numpy as np
+import pandas as pd
+from sklearn.preprocessing import LabelEncoder, StandardScaler
+from sklearn.model_selection import StratifiedKFold, train_test_split
+from sklearn.ensemble import RandomForestClassifier
+from xgboost import XGBClassifier
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import classification_report, confusion_matrix
+import warnings
+warnings.filterwarnings("ignore", category=UserWarning)
+
+# --- Load and prepare match data ---
+df = pd.read_csv('data/results.csv')
+df['date'] = pd.to_datetime(df['date'])
+df = df[df['date'] >= pd.Timestamp.now() - pd.DateOffset(years=10)].reset_index(drop=True)
+df = df.sort_values('date').reset_index(drop=True)
+
+# --- Load and prepare FIFA ranking data ---
+ranking_df = pd.read_csv('data/fifa_mens_rank.csv')
+ranking_df['team'] = ranking_df['team'].astype(str)
+ranking_df['date'] = pd.to_datetime(ranking_df['date'], errors='coerce')
+ranking_df = ranking_df[ranking_df['date'] >= pd.to_datetime('2015-01-01')]
+ranking_df = ranking_df[['date', 'team', 'total.points']].rename(columns={'total.points': 'points'})
+
+# --- Create match result label ---
+def get_result(row):
+    if row['home_score'] > row['away_score']:
+        return 'H'
+    elif row['home_score'] == row['away_score']:
+        return 'D'
+    else:
+        return 'A'
+df['result'] = df.apply(get_result, axis=1)
+
+# --- Feature engineering: recent form and goal differences ---
+def compute_recent_features(df, n=5):
+    recent_stats = []
+    team_history = {}
+
+    for idx, row in df.iterrows():
+        home = row['home_team']
+        away = row['away_team']
+        match_date = row['date']
+
+        home_wins = home_draws = home_losses = 0
+        away_wins = away_draws = away_losses = 0
+        home_goal_diff = 0
+        away_goal_diff = 0
+
+        if home in team_history:
+            past_home = [m for m in team_history[home] if m['date'] < match_date]
+            last_n_home = sorted(past_home, key=lambda x: x['date'], reverse=True)[:n]
+            for match in last_n_home:
+                if match['result'] == 'W': home_wins += 1
+                elif match['result'] == 'D': home_draws += 1
+                else: home_losses += 1
+                home_goal_diff += match['goal_diff']
+
+        if away in team_history:
+            past_away = [m for m in team_history[away] if m['date'] < match_date]
+            last_n_away = sorted(past_away, key=lambda x: x['date'], reverse=True)[:n]
+            for match in last_n_away:
+                if match['result'] == 'W': away_wins += 1
+                elif match['result'] == 'D': away_draws += 1
+                else: away_losses += 1
+                away_goal_diff += match['goal_diff']
+
+        recent_stats.append({
+            'recent_home_wins': home_wins,
+            'recent_home_draws': home_draws,
+            'recent_home_losses': home_losses,
+            'recent_away_wins': away_wins,
+            'recent_away_draws': away_draws,
+            'recent_away_losses': away_losses,
+            'recent_home_goal_diff': home_goal_diff,
+            'recent_away_goal_diff': away_goal_diff,
+        })
+
+        # Update history
+        home_result = 'W' if row['home_score'] > row['away_score'] else ('D' if row['home_score'] == row['away_score'] else 'L')
+        away_result = 'L' if home_result == 'W' else ('D' if home_result == 'D' else 'W')
+        home_goal_difference = row['home_score'] - row['away_score']
+        away_goal_difference = -home_goal_difference
+
+        team_history.setdefault(home, []).append({'date': match_date, 'result': home_result, 'goal_diff': home_goal_difference})
+        team_history.setdefault(away, []).append({'date': match_date, 'result': away_result, 'goal_diff': away_goal_difference})
+
+    recent_df = pd.DataFrame(recent_stats)
+    return pd.concat([df.reset_index(drop=True), recent_df], axis=1)
+
+df = compute_recent_features(df)
+
+# --- Add FIFA ranking points ---
+def get_ranking_points(team, match_date):
+    team = str(team)
+    match_date = pd.to_datetime(match_date)
+    filtered = ranking_df[(ranking_df['team'] == team) & (ranking_df['date'] <= match_date)]
+    if not filtered.empty:
+        return filtered.sort_values('date').iloc[-1]['points']
+    else:
+        return 0
+
+df['home_team_points'] = df.apply(lambda row: get_ranking_points(row['home_team'], row['date']), axis=1)
+df['away_team_points'] = df.apply(lambda row: get_ranking_points(row['away_team'], row['date']), axis=1)
+
+# --- Convert teams to numeric IDs ---
+df['home_team_id'] = df['home_team'].astype('category').cat.codes
+df['away_team_id'] = df['away_team'].astype('category').cat.codes
+
+# --- Define features and label ---
+feature_cols = [
+    'home_team_id', 'away_team_id', 'neutral',
+    'recent_home_wins', 'recent_home_draws', 'recent_home_losses',
+    'recent_away_wins', 'recent_away_draws', 'recent_away_losses',
+    'recent_home_goal_diff', 'recent_away_goal_diff',
+    'home_team_points', 'away_team_points'
+]
+
+X = df[feature_cols].values
+y = df['result'].values  # 'A', 'D', 'H'
+
+# --- Encode labels ---
+le = LabelEncoder()
+y_encoded = le.fit_transform(y)  # 'A','D','H' -> 0,1,2
+
+# --- Scale features ---
+scaler = StandardScaler()
+X_scaled = scaler.fit_transform(X)
+
+# --- Split data ---
+X_train, X_test, y_train_encoded, y_test_encoded = train_test_split(
+    X_scaled, y_encoded, test_size=0.2, random_state=42, stratify=y_encoded
+)
+
+# --- Define base models ---
+rf = RandomForestClassifier(random_state=42, n_estimators=100)
+xgb = XGBClassifier(
+    objective='multi:softprob',
+    num_class=3,
+    eval_metric='mlogloss',
+    use_label_encoder=False,
+    random_state=42,
+    colsample_bytree=0.8,
+    gamma=0,
+    learning_rate=0.3,
+    max_depth=3,
+    min_child_weight=1,
+    n_estimators=200,
+    reg_alpha=0,
+    reg_lambda=1,
+    subsample=0.8
+)
+
+# --- Prepare stacking arrays ---
+meta_features = np.zeros((X_train.shape[0], 6))  # 3 probs RF + 3 probs XGB
+
+from sklearn.model_selection import StratifiedKFold
+skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+
+# --- Generate out-of-fold predictions for meta-model training ---
+for train_idx, val_idx in skf.split(X_train, y_train_encoded):
+    X_train_fold, X_val_fold = X_train[train_idx], X_train[val_idx]
+    y_train_fold, y_val_fold = y_train_encoded[train_idx], y_train_encoded[val_idx]
+
+    rf.fit(X_train_fold, y_train_fold)
+    xgb.fit(X_train_fold, y_train_fold)
+
+    rf_val_pred = rf.predict_proba(X_val_fold)
+    xgb_val_pred = xgb.predict_proba(X_val_fold)
+
+    meta_features[val_idx, :3] = rf_val_pred
+    meta_features[val_idx, 3:] = xgb_val_pred
+
+# --- Train meta-model ---
+meta_model = LogisticRegression(max_iter=1000, random_state=42)
+meta_model.fit(meta_features, y_train_encoded)
+
+# --- Prepare test set meta-features ---
+rf_test_pred = rf.predict_proba(X_test)
+xgb_test_pred = xgb.predict_proba(X_test)
+meta_test_features = np.hstack([rf_test_pred, xgb_test_pred])
+
+# --- Predict and evaluate ---
+stacked_pred_encoded = meta_model.predict(meta_test_features)
+stacked_pred = le.inverse_transform(stacked_pred_encoded)
+y_test = le.inverse_transform(y_test_encoded)
+
+print("Stacking Ensemble Classification Report:")
+print(classification_report(y_test, stacked_pred))
+print("Confusion Matrix:")
+print(confusion_matrix(y_test, stacked_pred))
