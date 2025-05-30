@@ -1,4 +1,4 @@
-# Soccer Prediction System
+**# Soccer Prediction System
 
 This project predicts soccer match outcomes using machine learning models like Random Forest and XGBoost.
 
@@ -18,6 +18,6 @@ This project predicts soccer match outcomes using machine learning models like R
 
 ---
 
-*Author: Aviv Moss*  
+*Author: Aviv*  
 *Email: avivmoss13@gmail.com*
 
