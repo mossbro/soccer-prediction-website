@@ -1,5 +1,4 @@
-﻿# soccer-prediction-website
- # Soccer Prediction System
+# Soccer Prediction System
 
 This project predicts soccer match outcomes using machine learning models like Random Forest and XGBoost.
 
